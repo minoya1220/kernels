@@ -1,31 +1,46 @@
 import torch
 from softmax.softmax_fwd import softmax_fwd_builder
 from softmax.softmax_bwd import softmax_bwd_builder
+from softmax.plot import plot_bench
 import matplotlib.pyplot as plt
 from measure import benchmark
 from matplotlib.ticker import FuncFormatter
 from pathlib import Path
 
 BENCH_SIZE = 2**29
+TEST_M = 2**6 - 1
 
-def test_fwd(dims: list[int], dtypes=[torch.bfloat16]):#, torch.half, torch.float, torch.double]):
+TEST_DIMS = [3, 7, 8, 17, 64, 100, 257, 511, 633, 1021, 2049, 4099]
+BENCH_DIMS = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
+
+
+def test_fwd(dims: list[int], *, dtypes=(torch.bfloat16, torch.half, torch.float, torch.double), verbose=False):#, torch.half, torch.float, torch.double]):
+    failures = []
     for dtype in dtypes:
         for dim in dims:
-            X = torch.randn(2**6 - 1, dim, device='cuda', dtype=dtype)
+            X = torch.randn(TEST_M, dim, device='cuda', dtype=dtype)
 
             torch_softmax = torch.softmax(X.double(), dim=1).to(X.dtype)
             softmax_fwd = softmax_fwd_builder(X)
             try:
                 torch.testing.assert_close(torch_softmax, softmax_fwd(X))
-                print(f"fwd: dim={dim}, dtype={dtype}  passed")
-
-            except AssertionError as e:
+            except Exception as e:
+                failures.append((dim, dtype, e))
                 print(f"fwd: dim={dim}, dtype={dtype} failed")
+            else:
+                if verbose:
+                    print(f"fwd: dim={dim}, dtype={dtype}  passed")
+    if failures:
+        raise AssertionError(
+            f"fwd: {len(failures)}/{len(dims) * len(dtypes)} failed: "
+            + ", ".join(f"(dim={d}, {t})" for d, t, _ in failures)
+        )
 
-def test_bwd(dims: list[int], dtypes=[torch.bfloat16, torch.half, torch.float, torch.double]):
+def test_bwd(dims: list[int], *, dtypes=(torch.bfloat16, torch.half, torch.float, torch.double), verbose=False):
+    failures = []
     for dtype in dtypes:
         for dim in dims:
-            X = torch.randn(2**6 - 1, dim, device='cuda', dtype=dtype)
+            X = torch.randn(TEST_M, dim, device='cuda', dtype=dtype)
             dY = torch.randn_like(X)
             
             Y = torch.softmax(X, dim=1).to(dtype)
@@ -35,11 +50,17 @@ def test_bwd(dims: list[int], dtypes=[torch.bfloat16, torch.half, torch.float, t
             softmax_bwd = softmax_bwd_builder(Y, dY)
             try:
                 torch.testing.assert_close(ref_softmax_bwd, softmax_bwd(Y, dY))
-                print(f"bwd: dim={dim}, dtype={dtype} passed")
-
-            except AssertionError as e:
+            except Exception as e:
+                failures.append((dim, dtype, e))
                 print(f"bwd: dim={dim}, dtype={dtype} failed")
-
+            else:
+                if verbose:
+                    print(f"bwd: dim={dim}, dtype={dtype} passed")
+    if failures:
+        raise AssertionError(
+            f"bwd: {len(failures)}/{len(dims) * len(dtypes)} failed: "
+            + ", ".join(f"(dim={d}, {t})" for d, t, _ in failures)
+        )
 
 def benchmark_fwd(dims: list[int], *, dtype=torch.bfloat16, elems=BENCH_SIZE) -> list[float]:
     times = []
@@ -67,115 +88,21 @@ def benchmark_bwd(dims: list[int], *, dtype=torch.bfloat16, elems=BENCH_SIZE) ->
 
 
 
-def plot_bench(dims, times, passes, title, dtype=torch.bfloat16, *,
-            elems=BENCH_SIZE, reference=False, memory_clock=None,
-            color='#83a598', sizes=None, font='Lora', name=None):
-
-    c = dict(bg='#1d2021', fg='#ebdbb2', muted='#928374', grid='#32302f',
-            spine='#504945', band='#282828', line=color)
-    s = {**dict(base=11.5, title=13.5, axis_label=11.5, tick=9.5, ref=9.5),
-        **(sizes or {})}
-    path = Path(__file__).parent / "plots" / f"{name or title.lower().replace(' ', '_')}.png"
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    p = torch.cuda.get_device_properties(0)
-    memory_clock = p.memory_clock_rate * 1e-3 if memory_clock is None else memory_clock
-    peak = p.memory_bus_width / 8 * memory_clock * 1e6 * 2 / 1e9
-
-
-    esize = torch.finfo(dtype).bits // 8
-    gb = [passes * elems * esize / (t * 1e-3) / 1e9 for t in times]
-
-    lines = [(peak, ':', f'theoretical peak · {peak:.0f} GB/s')]
-
-    if reference:
-        ops = {
-            2: (1, lambda a, *, out: out.copy_(a), 'torch copy (1r+1w)'),
-            3: (2, torch.add, 'torch add (2r+1w)'),
-        }
-        if passes not in ops:
-            raise ValueError(f"no reference op for passes={passes}, have {sorted(ops)}")
-        n_in, fn, ref_label = ops[passes]
-
-        ins = [torch.randn(elems, device='cuda', dtype=dtype) for _ in range(n_in)]
-        out = torch.empty_like(ins[0])
-        t_ref = benchmark(fn, ins, [out])
-        ref = passes * ins[0].nbytes / (t_ref * 1e-3) / 1e9
-
-        lines.append((ref, '--', f'{ref_label} · {ref:.0f} GB/s'))
-
-    rc = {
-        'font.family': 'serif',
-        'font.serif': [font, 'TeX Gyre Pagella', 'DejaVu Serif'],
-        'mathtext.fontset': 'cm', 'font.size': s['base'],
-        'figure.facecolor': c['bg'], 'axes.facecolor': c['bg'],
-        'savefig.facecolor': c['bg'],
-        'text.color': c['fg'], 'axes.labelcolor': c['fg'],
-        'xtick.color': c['muted'], 'ytick.color': c['muted'],
-        'axes.edgecolor': c['spine'], 'axes.linewidth': 0.8,
-        'xtick.major.size': 3, 'ytick.major.size': 3,
-        'axes.spines.top': False, 'axes.spines.right': False,
-    }
-
-    with plt.rc_context(rc):
-        fig, ax = plt.subplots(figsize=(7.6, 4.8),
-                            constrained_layout=dict(w_pad=0.18, h_pad=0.16))
-        top, xr = peak * 1.10, dims[-1] * 1.42
-
-        ax.set_axisbelow(True)
-        ax.grid(axis='y', color=c['grid'], lw=0.7)
-        ax.axhspan(peak, top, color=c['band'], lw=0, zorder=0)
-
-        for y, ls, txt in lines:
-            ax.axhline(y, ls=ls, lw=1.0, color=c['muted'], zorder=2)
-            ax.annotate(txt, xy=(0.015, y), xycoords=ax.get_yaxis_transform(),
-                        xytext=(0, 3), textcoords='offset points',
-                        fontsize=s['ref'], color=c['muted'],
-                        ha='left', va='bottom', zorder=4)
-
-        ax.fill_between(dims, gb, color=c['line'], alpha=0.10, zorder=1)
-        ax.plot(dims, gb, 'o-', ms=5, lw=2, color=c['line'], zorder=3)
-
-        ax.set_xscale('log', base=2)
-        ax.set_xticks(dims)
-        ax.set_xticklabels([str(d) for d in dims], rotation=45, ha='right',
-                        rotation_mode='anchor', fontsize=s['tick'])
-        ax.tick_params(axis='y', labelsize=s['tick'])
-        ax.set_xlim(dims[0] / 1.55, xr)
-        ax.set_ylim(0, top)
-        ax.set_xlabel('row length $N$', labelpad=8, fontsize=s['axis_label'])
-        ax.set_ylabel('achieved bandwidth (GB/s)', labelpad=8, fontsize=s['axis_label'])
-        ax.set_title(title, fontsize=s['title'], loc='left', color=c['line'], pad=12)
-
-        sec = ax.secondary_yaxis(
-            'right', functions=(lambda g: g / peak * 100, lambda q: q / 100 * peak))
-        sec.set_ylabel('% of theoretical peak', labelpad=10, fontsize=s['axis_label'])
-        sec.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f'{v:.0f}%'))
-        sec.spines['right'].set_visible(True)
-        sec.spines['right'].set_color(c['spine'])
-        sec.tick_params(colors=c['muted'], labelsize=s['tick'])
-        sec.yaxis.label.set_color(c['fg'])
-
-        fig.savefig(path, dpi=150)
-        plt.close(fig)
-
-
 
 if __name__ == "__main__":
     
     torch.manual_seed(123)
 
-    test_dims = [3, 7, 8, 64, 100, 257, 1021, 2048, 2049, 4099, 8192, 32768, 131072]
-    bench_dims = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
-    # test_fwd(bench_dims + test_dims)
-    # test_bwd(bench_dims + test_dims)
-
-    # with MeasureMemoryClock(interval=0.01) as mem_clk:
-    fwd_times = benchmark_fwd(bench_dims)
-    plot_bench(bench_dims, fwd_times, 2, 'Softmax Forward10', color='#83a598', reference=True)
+    test_fwd(BENCH_DIMS + TEST_DIMS, dtypes=(torch.bfloat16,))
+    test_bwd(BENCH_DIMS + TEST_DIMS, dtypes=(torch.bfloat16,))
+    print("tests pass")
     
-    # bwd_times = benchmark_bwd(bench_dims)
-    # plot_bench(bench_dims, bwd_times, 3, 'Softmax Backward', color='#fabd2f', reference=True)
+    # with MeasureMemoryClock(interval=0.01) as mem_clk:
+    fwd_times = benchmark_fwd(BENCH_DIMS)
+    plot_bench(BENCH_DIMS, fwd_times, 1, BENCH_SIZE, 'Softmax Forward', color='#83a598', reference=True)
+    
+    bwd_times = benchmark_bwd(BENCH_DIMS)
+    plot_bench(BENCH_DIMS, bwd_times, 2, BENCH_SIZE, 'Softmax Backward', color='#fabd2f', reference=True)
     
     # from torch.profiler import profile, ProfilerActivity
     # with profile(
@@ -187,7 +114,7 @@ if __name__ == "__main__":
 
     # test_fwd([2**16])
 
-    # TODO: fix plotting output dir, pack bf16s, do writeup, rename repo, remove softmax pkg, add controls to enable unoptimized versions
+    # TODO:  pack bf16s, do writeup, rename repo, add controls to enable unoptimized versions
     # On packing -> i think we should have a path where if the width is 16 bits or less floats can get packed as bf16s (lower dtypes get upcasted to bf16 bc no inf) or halfs
     print("success")
 

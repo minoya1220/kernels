@@ -209,7 +209,7 @@ def softmax_fwd_builder(X: torch.Tensor) -> Callable:
 
 
     compiled_kernel = cute.compile(softmax_fwd_launcher, mX, mY)
-    print(compiled_kernel.__ptx__)
+
     def kernel_wrapper(X: torch.Tensor, *, out: torch.Tensor = None) -> torch.Tensor:
         original_shape = X.shape
         X = X.flatten(0,-2)
