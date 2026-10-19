@@ -1,5 +1,5 @@
 [project]
-name = "gpu-kernels"
+name = "kernels"
 version = "0.1.0"
 description = "A repo of GPU kernels ive written."
 readme = "README.md"

@@ -2,97 +2,119 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+import math
+
 
 @triton.jit
-def flash_attn_kernel(q_ptr, k_ptr, v_ptr, 
-               out_ptr, 
-               N: int, d_model: int, d_h: int, 
-               BLK_SIZE_N: tl.constexpr, BLK_SIZE_H: tl.constexpr):
-    
-    pid_qN = tl.program_id(0)
-    pid_H = tl.program_id(1)
-    
-    offset_qN = tl.arange(0, BLK_SIZE_N) + pid_qN * BLK_SIZE_N
-    offset_H = tl.arange(0, BLK_SIZE_H) + pid_H * d_h
+def flash_attn_fwd_kernel(
+    q_ptr, q_sB, q_sH, q_sM,
+    k_ptr, k_sB, k_sH, k_sN,
+    v_ptr, v_sB, v_sH, v_sN,
+    out_ptr, out_sB, out_sH, out_sM,
+    lse_ptr, lse_sB, lse_sH,
+    M, N, D,
+    scale_log2e,                            
+    BLK_SIZE_M: tl.constexpr, BLK_SIZE_N: tl.constexpr,
+    BLK_SIZE_D: tl.constexpr, CAUSAL: tl.constexpr
+):
+    idx_B = tl.program_id(2)
+    idx_H = tl.program_id(1)
+    idx_M = tl.arange(0, BLK_SIZE_M) + tl.program_id(0) * BLK_SIZE_M
+    idx_D = tl.arange(0, BLK_SIZE_D)
 
-    mask_qN = offset_qN < N
-    mask_H = tl.arange(0, BLK_SIZE_H) < d_h 
-    
-    offset_q = offset_qN[:, None] * d_model + offset_H[None,:]
-    mask_q = mask_qN[:, None] & mask_H[None, :]
+    q_ptr += idx_B * q_sB + idx_H * q_sH
+    k_ptr += idx_B * k_sB + idx_H * k_sH
+    v_ptr += idx_B * v_sB + idx_H * v_sH
+    out_ptr += idx_B * out_sB + idx_H * out_sH
+    lse_ptr += idx_B * lse_sB + idx_H * lse_sH
+
+    mask_M = idx_M < M
+    mask_D = idx_D < D
+    mask_MD = mask_M[:, None] & mask_D[None, :]
+
+    q_ptrs = q_ptr + idx_M[:, None] * q_sM + idx_D[None, :]
+
+    tile_q = tl.load(q_ptrs, mask=mask_MD, other=0.0)
+
+    tile_q = (tile_q * scale_log2e).to(q_ptr.dtype.element_ty)
+    accum = tl.zeros((BLK_SIZE_M, BLK_SIZE_D), tl.float32)
+    running_max = tl.full((BLK_SIZE_M,), float('-inf'), tl.float32)
+    running_sum = tl.zeros((BLK_SIZE_M,), tl.float32)
+
+    bound = N
+    if CAUSAL:
+        bound = (tl.program_id(0) + 1) * BLK_SIZE_M
+
+    for kv_i in range(0, bound, BLK_SIZE_N):
+        idx_N = tl.arange(0, BLK_SIZE_N) + kv_i
+        mask_N = idx_N < N
+
+        k_ptrs = k_ptr + idx_N[:, None] * k_sN + idx_D[None, :]
+        v_ptrs = v_ptr + idx_N[:, None] * v_sN + idx_D[None, :]
+        mask_ND = mask_N[:, None] & mask_D[None, :]
+
+        tile_k = tl.load(k_ptrs, mask=mask_ND, other=0.0)
+        tile_v = tl.load(v_ptrs, mask=mask_ND, other=0.0)
+
+        tile_p = tile_q @ tile_k.T 
 
 
-    tile_q = tl.load(q_ptr + offset_q, mask=mask_q, other=0.0)
-    accum = tl.zeros((BLK_SIZE_N, BLK_SIZE_H), tl.float32)
-    running_max = tl.full((BLK_SIZE_N,),float('-inf'), tl.float32) 
-    running_sum = tl.zeros((BLK_SIZE_N,), tl.float32)
+        mask_p = mask_N[None, :]
+        if CAUSAL:
+            mask_p &= idx_M[:, None] >= idx_N[None, :]
 
-    for kv_i in range(0, N, BLK_SIZE_N):
-        offset_kvN = tl.arange(0, BLK_SIZE_N) + kv_i 
-        mask_kvN = offset_kvN < N 
+        tile_p = tl.where(mask_p, tile_p, float('-inf'))
 
-        offset_kv = offset_kvN[:,None] * d_model + offset_H[None,:]
-        mask_kv = mask_kvN[:, None] & mask_H[None, :]
+        current_max = tl.maximum(tl.max(tile_p, 1), running_max)
+        tile_p_scores = tl.math.exp2(tile_p - current_max[:, None])
+        rescale = tl.math.exp2(running_max - current_max)
 
-        tile_k = tl.load(k_ptr + offset_kv, mask=mask_kv, other=0.0)
-        tile_v = tl.load(v_ptr + offset_kv, mask=mask_kv, other=0.0)
-        
-        
-        tile_qkt = tl.dot(tile_q, tile_k.T) / tl.sqrt(tl.cast(d_h, tl.float32)) # Q @ K.T / √d_h
-        mask_qkt = (tl.arange(0, BLK_SIZE_N)[:,None] < N) & (offset_kvN[None, :] < N) 
-        tile_qkt = tl.where(mask_qkt, tile_qkt, float('-inf')) 
+        accum *= rescale[:, None]
+        accum = tl.dot(tile_p_scores.to(tile_v.dtype), tile_v, accum)
 
-        current_max = tl.maximum(tl.max(tile_qkt, 1), running_max)
-        tile_qkt_scores = tl.exp(tile_qkt - current_max[:, None])
-        rescale = tl.exp(running_max - current_max)
-        tile_qkv = tl.dot(tile_qkt_scores, tile_v) 
-        
         running_max = current_max
-        running_sum = tl.fma(running_sum, rescale, tl.sum(tile_qkt_scores, 1))
-        accum = tl.fma(accum, rescale[:, None], tile_qkv)
-        
+        running_sum = tl.fma(running_sum, rescale, tl.sum(tile_p_scores, 1))
+
     accum /= running_sum[:, None]
 
-    tl.store(out_ptr + offset_q, accum, mask=mask_q) # output and Q have the same shape
-    
+    out_ptrs = out_ptr + idx_M[:, None] * out_sM + idx_D[None, :]
+    lse_ptrs = lse_ptr + idx_M
 
-# Q, K, V, output are tensors on the GPU
-def flash_attn(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, h: int):
-    d_model = Q.shape[-1]
-    N = Q.shape[-2]
+    tl.store(lse_ptrs, running_max + tl.math.log2(running_sum), mask=mask_M)
+    tl.store(out_ptrs, accum.to(out_ptr.dtype.element_ty), mask=mask_MD)  # out and Q have the same shape
 
+
+def flash_attn_fwd(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, is_causal=False, return_lse=False):
+    assert Q.shape == K.shape == V.shape
+    assert Q.is_cuda and all(t.stride(-1) == 1 for t in (Q, K, V))
+
+
+    B, H, M, D = Q.shape
+    N = K.shape[2]
+
+    BLK_SIZE_M = 128
     BLK_SIZE_N = 64
-    d_h = d_model // h
-    BLK_SIZE_H = max(32, triton.next_power_of_2(d_h))
-    
-    output = torch.empty_like(Q)
-
-    grid = (triton.cdiv(N,BLK_SIZE_N),h) 
-    flash_attn_kernel[grid](Q, K, V, output, N, d_model, d_h, BLK_SIZE_N, BLK_SIZE_H)
-    
-    return output
+    BLK_SIZE_D = max(32, triton.next_power_of_2(D))
 
 
-if __name__ =="__main__":
-    d_model = 512
-    N = 2048
-    h = 8
+    output = torch.empty(Q.shape, device=Q.device, dtype=Q.dtype)
+    lse = torch.empty((B, H, M), device=Q.device, dtype=torch.float32)
 
-    Q = torch.randn(N, d_model, device="cuda")
-    K = torch.randn_like(Q)
-    V = torch.randn_like(Q)
+    grid = (triton.cdiv(M, BLK_SIZE_M), H, B)
 
-    
-    # verify correctness
-    actual = flash_attn(Q, K, V, h=h)
-    
-    Q_multihead = Q.view(N, h, d_model // h).transpose(0,1)
-    K_multihead = K.view(N, h, d_model // h).transpose(0,1)
-    V_multihead = V.view(N, h, d_model // h).transpose(0,1)
-    expected = F.scaled_dot_product_attention(Q_multihead, K_multihead, V_multihead)
-    expected = expected.transpose(0,1).contiguous().view(N, d_model)
-    
-    torch.testing.assert_close(expected, actual)
-    print("passed")
+    scale_log2e = 1.0 / (D ** 0.5) * math.log2(math.e)
 
-    
+    flash_attn_fwd_kernel[grid](
+        Q, *Q.stride()[:3],
+        K, *K.stride()[:3],
+        V, *V.stride()[:3],
+        output, *output.stride()[:3],
+        lse, *lse.stride()[:2],
+        M, N, D,
+        scale_log2e,
+        BLK_SIZE_M, BLK_SIZE_N, BLK_SIZE_D, is_causal,
+        num_warps=8, num_stages=3
+    )
+
+    # TODO: refactor so that outputs are passed as inputs to this function
+    return (output, lse) if return_lse else output
