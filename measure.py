@@ -21,19 +21,20 @@ def benchmark(fn: Callable, inputs: Iterable[torch.Tensor] | torch.Tensor = (), 
         inputs_buffers = [tuple(t.clone() for t in inputs) for _ in range(0, n_buffers)]
         outputs_buffers = [tuple(t.clone() for t in outputs) for _ in range(0, n_buffers)]
 
+    # function wrappers needed to match torch api
     num_outs = len(outputs_buffers[0])
     if num_outs == 0:
-        caller = lambda i, o: fn(*i)
+        wrapped_fn = lambda i, o: fn(*i)
     elif num_outs == 1:
-        caller = lambda i, o: fn(*i, out=o[0]) 
+        wrapped_fn = lambda i, o: fn(*i, out=o[0]) 
     else:
-        caller = lambda i, o: fn(*i, out=o)
+        wrapped_fn = lambda i, o: fn(*i, out=o)
 
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for i in range(0, warmup):
-            caller(inputs_buffers[i % n_buffers], outputs_buffers[i % n_buffers])
+            wrapped_fn(inputs_buffers[i % n_buffers], outputs_buffers[i % n_buffers])
     torch.cuda.current_stream().wait_stream(s)
     torch.cuda.synchronize()
     
@@ -44,7 +45,7 @@ def benchmark(fn: Callable, inputs: Iterable[torch.Tensor] | torch.Tensor = (), 
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         for i in range(0, iters):
-            caller(inputs_buffers[i % n_buffers], outputs_buffers[i % n_buffers])
+            wrapped_fn(inputs_buffers[i % n_buffers], outputs_buffers[i % n_buffers])
     
     torch.cuda.synchronize()
     times = []

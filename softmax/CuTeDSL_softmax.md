@@ -55,3 +55,5 @@ maybe add a table of largest vector load vs generation
 %% address limitations like other hardware, no cluster reduce, and very large softmaxes on low batch sizes.
 
 ## References
+
+%% mention batch invariance and link thinking machiines blog post
