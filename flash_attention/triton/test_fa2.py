@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 import torch.nn.functional as F
 import pytest
-from triton_fa2 import flash_attention
+from fa2 import flash_attention
 
 TOLERANCES = {"atol": 2e-2, "rtol": 1e-2}
 

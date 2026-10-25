@@ -1,6 +1,6 @@
 import torch
-from triton_fa2_bwd import flash_attn_bwd
-from triton_fa2_fwd import flash_attn_fwd
+from fa2_bwd import flash_attn_bwd
+from fa2_fwd import flash_attn_fwd
 
 
 class FlashAttention(torch.autograd.Function):
