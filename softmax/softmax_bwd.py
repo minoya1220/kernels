@@ -7,24 +7,24 @@ from collections.abc import Callable
 from cutlass import Float32, Boolean
 from cutlass.cute.runtime import from_dlpack
 from math import gcd
-from utils import warp_reduction_partial
+from utils.cute_dsl import warp_reduction_partial
 
 
 @cute.kernel
 def softmax_bwd_kernel(
-                    gY: cute.Tensor, 
-                    gdY: cute.Tensor, 
-                    gdX: cute.Tensor,
-                    cY: cute.Tensor,
-                    tv_layout: cute.Layout, 
-                    tiler: cute.Shape, 
-                    shape: cute.Shape,
-                    tiled_copy: cute.TiledCopy, 
-                    n_iters: cutlass.Constexpr, 
-                    vec_size: cutlass.Constexpr,
-                    threads_per_row: cutlass.Constexpr,
-                    bdim: cutlass.Constexpr
-                ):
+    gY: cute.Tensor, 
+    gdY: cute.Tensor, 
+    gdX: cute.Tensor,
+    cY: cute.Tensor,
+    tv_layout: cute.Layout, 
+    tiler: cute.Shape, 
+    shape: cute.Shape,
+    tiled_copy: cute.TiledCopy, 
+    n_iters: cutlass.Constexpr, 
+    vec_size: cutlass.Constexpr,
+    threads_per_row: cutlass.Constexpr,
+    bdim: cutlass.Constexpr
+):
 
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()

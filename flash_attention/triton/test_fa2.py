@@ -1,11 +1,14 @@
 import torch
-import triton
-import triton.language as tl
 import torch.nn.functional as F
 import pytest
 from fa2 import flash_attention
 
 TOLERANCES = {"atol": 2e-2, "rtol": 1e-2}
+
+
+@pytest.fixture(autouse=True)
+def seed():
+    torch.manual_seed(4)
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("N", [13, 128, 131, 654, 2048])

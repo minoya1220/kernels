@@ -4,37 +4,27 @@ import torch
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 from collections.abc import Callable
-from cutlass import Float32, Boolean, Int16
+from cutlass import Float32
 from cutlass.cute.runtime import from_dlpack
 from math import gcd
-from utils import warp_reduction_partial
-
-
-
-from typing import Optional
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import dsl_user_op
-from cutlass import Float32
-
-
+from utils.cute_dsl import warp_reduction_partial
 
 
 
 @cute.kernel
 def softmax_fwd_kernel(
-                    gX: cute.Tensor, 
-                    gY: cute.Tensor, 
-                    cX: cute.Tensor, 
-                    tv_layout: cute.Layout, 
-                    tiler: cute.Shape, 
-                    shape: cute.Shape,
-                    tiled_copy: cute.TiledCopy, 
-                    n_iters: cutlass.Constexpr, 
-                    vec_size: cutlass.Constexpr,
-                    threads_per_row: cutlass.Constexpr,
-                    bdim: cutlass.Constexpr
-                ):
+    gX: cute.Tensor, 
+    gY: cute.Tensor, 
+    cX: cute.Tensor, 
+    tv_layout: cute.Layout, 
+    tiler: cute.Shape, 
+    shape: cute.Shape,
+    tiled_copy: cute.TiledCopy, 
+    n_iters: cutlass.Constexpr, 
+    vec_size: cutlass.Constexpr,
+    threads_per_row: cutlass.Constexpr,
+    bdim: cutlass.Constexpr
+):
 
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -226,23 +216,7 @@ def softmax_fwd_builder(X: torch.Tensor) -> Callable:
 
 
 
-# @dsl_user_op
-# def cvt_bf16_f32_alt(
-#     src_bf16: ir.Value,
-#     *,
-#     loc: Optional[ir.Location] = None,
-#     ip: Optional[ir.InsertionPoint] = None,
-# ) -> Float32:
-#     v = src_bf16 if isinstance(src_bf16, ir.Value) else src_bf16.ir_value(loc=loc, ip=ip)
-#     v_i16 = llvm.bitcast(Int16.mlir_type, v, loc=loc, ip=ip)
-#     instr = "mov.b32 $0, {0, $1};"# "cvt.f32.bf16 $0, $1;"
-#     res = llvm.inline_asm(
-#         Float32.mlir_type, [v_i16],
-#         instr, "=f,h",
-#         has_side_effects=True, is_align_stack=False,
-#         asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
-#     )
-#     return Float32(res)
+
 
  
 # # if this isnt enough to bring perf up for larger sizes could try using SMEM as a expanded register file, could increase cache size up to ~50% <- use cp asnyc for this if attempted

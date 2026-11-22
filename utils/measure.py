@@ -1,40 +1,48 @@
+from collections import deque
+
 import torch
 import pynvml
-import threading, time
-from collections.abc import Iterable, Callable
+import threading
+from collections.abc import Callable
+from torch.utils._pytree import tree_map_only
+from statistics import median
 
+L2_BUFFER_SIZE = 1024 * 2**20 # 1 GB is larger than L2 cache for any currently available gpu
 
-def benchmark(fn: Callable, inputs: Iterable[torch.Tensor] | torch.Tensor = (), outputs: Iterable[torch.Tensor] | torch.Tensor = (),*, warmup=20, iters=100, L2_clear=True):
-    inputs = (inputs,) if isinstance(inputs, torch.Tensor) else tuple(inputs)
-    outputs = (outputs,) if isinstance(outputs, torch.Tensor) else tuple(outputs)
+def benchmark(bench_fn: Callable, *args, bench_warmup_iters=20, bench_iters=100, bench_repeats = 5, bench_rotate_L2=True, **kwargs):
+    packed_args = (args, kwargs)
+    args_buffer = [packed_args]
 
-    inputs_buffers = [inputs]
-    outputs_buffers = [outputs]
-    n_buffers = 1
+    if bench_rotate_L2:
+        args_buffer = []
+        buffer_size = 0
+        args_size = -1
+        alias_table = {}
+        
+        def clone_helper(tensor):
+            tensor_id = id(tensor)
+            if tensor_id not in alias_table:
+                alias_table[tensor_id] = tensor.detach().clone().requires_grad_(tensor.requires_grad)
+            return alias_table[tensor_id]
 
-    if L2_clear:
-        assert inputs and outputs, "Input and Output Tensors are required to rotate L2"
-        size = sum([t.nbytes for t in (*inputs, *outputs)])
-        buffer_size = 256 * 2**20 # 256 MB clears l2 for all modern gpus
-        n_buffers =  min(iters, buffer_size // size + 1)
+        idx = 0
+        while buffer_size < L2_BUFFER_SIZE and idx < bench_iters:
+            alias_table = {}
+            args_buffer.append(tree_map_only(torch.Tensor, clone_helper, packed_args))
+            if idx == 0:
+               args_size = sum(tensor.nbytes for tensor in alias_table.values())
+            buffer_size += args_size
+            idx += 1
+            
 
-        inputs_buffers = [tuple(t.clone() for t in inputs) for _ in range(0, n_buffers)]
-        outputs_buffers = [tuple(t.clone() for t in outputs) for _ in range(0, n_buffers)]
-
-    # function wrappers needed to match torch api
-    num_outs = len(outputs_buffers[0])
-    if num_outs == 0:
-        wrapped_fn = lambda i, o: fn(*i)
-    elif num_outs == 1:
-        wrapped_fn = lambda i, o: fn(*i, out=o[0]) 
-    else:
-        wrapped_fn = lambda i, o: fn(*i, out=o)
-
+    # launching on a sidestream is a bit overkill, only needed if the stream gets cached by fn
+    outs = deque(maxlen=len(args_buffer)) # ring_buffer to keep size bounded
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
-        for i in range(0, warmup):
-            wrapped_fn(inputs_buffers[i % n_buffers], outputs_buffers[i % n_buffers])
+        for i in range(0, bench_warmup_iters):
+            args_i, kwargs_i = args_buffer[i % len(args_buffer)] 
+            outs.append(bench_fn(*args_i, **kwargs_i))
     torch.cuda.current_stream().wait_stream(s)
     torch.cuda.synchronize()
     
@@ -43,27 +51,30 @@ def benchmark(fn: Callable, inputs: Iterable[torch.Tensor] | torch.Tensor = (), 
     end = torch.cuda.Event(enable_timing=True)
 
     g = torch.cuda.CUDAGraph()
+
+    outs = deque(maxlen=len(args_buffer))
     with torch.cuda.graph(g):
-        for i in range(0, iters):
-            wrapped_fn(inputs_buffers[i % n_buffers], outputs_buffers[i % n_buffers])
-    
+        for i in range(0, bench_iters):
+            args_i, kwargs_i = args_buffer[i % len(args_buffer)] 
+            outs.append(bench_fn(*args_i, **kwargs_i))
+
+    g.replay()
     torch.cuda.synchronize()
     times = []
-    for i in range(5):
+    for i in range(bench_repeats):
         start.record()
         g.replay()
         end.record()
         torch.cuda.synchronize()
-        times.append(start.elapsed_time(end) / iters)
-    times.sort()
-    median_time = times[len(times) // 2]
-    return median_time
+        times.append(start.elapsed_time(end) / bench_iters)
+
+    return median(times)
 
 
-class MeasureMemoryClock():
+class MeasureMemoryClock:
     def __init__(self, interval=0.05):
         pynvml.nvmlInit()
-        self.handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        self.handle = torch.cuda.current_device()
         self.samples = []
         self._stop = threading.Event()
         self.interval = interval
@@ -76,6 +87,8 @@ class MeasureMemoryClock():
             self._stop.wait(interval)
     
     def __enter__(self):
+        self._stop.clear()
+        self.samples = []
         self.thread = threading.Thread(target=self.sample_clk, args=(self.interval,), daemon=True)
         self.thread.start()
         return self

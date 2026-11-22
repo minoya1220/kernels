@@ -1,23 +1,13 @@
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 import math
 
-SEARCH_SPACE = [
-    triton.Config({"BLK_SIZE_M": 128, "BLK_SIZE_N":  32}, num_warps=4, num_stages=2),
-    triton.Config({"BLK_SIZE_M": 128, "BLK_SIZE_N":  64}, num_warps=4, num_stages=2),
-    triton.Config({"BLK_SIZE_M": 128, "BLK_SIZE_N":  64}, num_warps=8, num_stages=2),
-    triton.Config({"BLK_SIZE_M": 128, "BLK_SIZE_N": 128}, num_warps=8, num_stages=1),
-    triton.Config({"BLK_SIZE_M":  64, "BLK_SIZE_N":  64}, num_warps=4, num_stages=2),
-    triton.Config({"BLK_SIZE_M":  64, "BLK_SIZE_N":  64}, num_warps=4, num_stages=3),
-    triton.Config({"BLK_SIZE_M":  64, "BLK_SIZE_N": 128}, num_warps=4, num_stages=2),
-    triton.Config({"BLK_SIZE_M":  64, "BLK_SIZE_N":  32}, num_warps=4, num_stages=3),
-    triton.Config({"BLK_SIZE_M":  32, "BLK_SIZE_N":  32}, num_warps=2, num_stages=2),
-    triton.Config({"BLK_SIZE_M":  16, "BLK_SIZE_N":  16}, num_warps=2, num_stages=1),
-]
+from utils.tuner import tuner, Param
+from utils.python import ceil_pow2, ceil_div, get_dir
 
-@triton.autotune(configs=SEARCH_SPACE, key=["M", "N", "BLK_SIZE_D", "CAUSAL"], cache_results=True)
+
+
 @triton.jit
 def flash_attn_fwd_kernel(
     q_ptr, q_sB, q_sH, q_sM,
@@ -96,22 +86,40 @@ def flash_attn_fwd_kernel(
     tl.store(out_ptrs, accum.to(out_ptr.dtype.element_ty), mask=mask_MD)  
 
 
-def flash_attn_fwd(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal):
+FWD_PARAMS = {
+    "BLK_SIZE_M": Param((32, 64, 128), 64), 
+    "BLK_SIZE_N": Param((32, 64, 128), 64),
+    "num_warps": Param((4, 8), 4),
+    "num_stages": Param((1, 2, 3), 2)
+}
+
+def fwd_args2keys(K: torch.Tensor, causal):
+    return {
+        "N": ceil_pow2(K.shape[2]), 
+        "BLK_SIZE_D": max(32, ceil_pow2(K.shape[3])), 
+        "CAUSAL": int(causal), 
+    }
+
+@tuner(get_dir(__file__) / "fwd.csv", FWD_PARAMS, fwd_args2keys, invalidate_cache=False)
+def flash_attn_fwd(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal, *, out=None, BLK_SIZE_M, BLK_SIZE_N, num_warps, num_stages):
     assert Q.shape == K.shape == V.shape
     assert Q.is_cuda and all(t.stride(-1) == 1 for t in (Q, K, V))
 
+    keys = fwd_args2keys(K, causal)
 
     B, H, M, D = Q.shape
     N = K.shape[2]
  
+    BLK_SIZE_D = keys["BLK_SIZE_D"]
 
-    BLK_SIZE_D = max(32, triton.next_power_of_2(D))
 
+    output, lse = out if out is not None else (
+        torch.empty(Q.shape, device=Q.device, dtype=Q.dtype), 
+        torch.empty((B, H, M), device=Q.device, dtype=torch.float32)
+    )
+     
 
-    output = torch.empty(Q.shape, device=Q.device, dtype=Q.dtype)
-    lse = torch.empty((B, H, M), device=Q.device, dtype=torch.float32)
-
-    grid = lambda params: (triton.cdiv(M, params["BLK_SIZE_M"]), H, B) # autotuner removes BLK_SIZE_M from scope
+    grid = (ceil_div(M, BLK_SIZE_M), H, B)
 
     scale_log2e = 1.0 / (D ** 0.5) * math.log2(math.e)
 
@@ -124,6 +132,8 @@ def flash_attn_fwd(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal):
         M, N, D,
         scale_log2e,
         BLK_SIZE_D=BLK_SIZE_D, CAUSAL=causal,
+        BLK_SIZE_M=BLK_SIZE_M, BLK_SIZE_N=BLK_SIZE_N,
+        num_warps=num_warps, num_stages=num_stages
     )
 
     return (output, lse)

@@ -1,23 +1,15 @@
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 import math
 
+from utils.tuner import tuner, Param
+from utils.python import ceil_pow2, ceil_div, get_dir
 
-SEARCH_SPACE = [
-    triton.Config({"BLK_SIZE_M":  64, "BLK_SIZE_N":  64}, num_warps=8, num_stages=1),
-    triton.Config({"BLK_SIZE_M":  64, "BLK_SIZE_N":  64}, num_warps=4, num_stages=2),
-    triton.Config({"BLK_SIZE_M":  64, "BLK_SIZE_N": 128}, num_warps=8, num_stages=1),
-    triton.Config({"BLK_SIZE_M": 128, "BLK_SIZE_N":  64}, num_warps=8, num_stages=1),
-    triton.Config({"BLK_SIZE_M":  32, "BLK_SIZE_N":  64}, num_warps=4, num_stages=2),
-    triton.Config({"BLK_SIZE_M":  64, "BLK_SIZE_N":  32}, num_warps=4, num_stages=2),
-    triton.Config({"BLK_SIZE_M":  32, "BLK_SIZE_N":  32}, num_warps=4, num_stages=2),
-    triton.Config({"BLK_SIZE_M":  16, "BLK_SIZE_N":  16}, num_warps=2, num_stages=1),
-]
+
 
 @triton.jit
-def flash_attn_preprocess_kernel(
+def flash_attn_bwd_preprocess_kernel(
     out_ptr, out_sB, out_sH, out_sM,
     dq_ptr, dq_sB, dq_sH, dq_sM,
     dout_ptr, dout_sB, dout_sH, dout_sM,
@@ -52,18 +44,17 @@ def flash_attn_preprocess_kernel(
     tl.store(delta_ptr + idx_M, delta, mask=mask_M)
 
 
-@triton.autotune(configs=SEARCH_SPACE, key=["M", "N", "BLK_SIZE_D", "DETERMINISTIC", "CAUSAL"], restore_value=["dq_ptr"], cache_results=True)
 @triton.jit
-def flash_attn_bwd_kernel(
+def flash_attn_bwd_main_kernel(
     q_ptr, q_sB, q_sH, q_sM,
     k_ptr, k_sB, k_sH, k_sN,
     v_ptr, v_sB, v_sH, v_sN,
     dout_ptr, dout_sB, dout_sH, dout_sM,
     lse_ptr, lse_sB, lse_sH,
     delta_ptr, delta_sB, delta_sH,
+    dq_ptr, dq_sB, dq_sH, dq_sM,
     dk_ptr, dk_sB, dk_sH, dk_sN,
     dv_ptr, dv_sB, dv_sH, dv_sN,
-    dq_ptr, dq_sB, dq_sH, dq_sM,
     M, N, D,
     scale, scale_log2e,                            
     BLK_SIZE_D: tl.constexpr, CAUSAL: tl.constexpr, DETERMINISTIC: tl.constexpr,
@@ -145,7 +136,6 @@ def flash_attn_bwd_kernel(
     tl.store(dk_ptrs, tile_dk.to(dk_ptr.dtype.element_ty), mask=mask_ND) 
 
     
-@triton.autotune(configs=SEARCH_SPACE, key=["M", "N", "BLK_SIZE_D", "CAUSAL"], cache_results=True)
 @triton.jit
 def flash_attn_bwd_dq_kernel(
     q_ptr, q_sB, q_sH, q_sM,
@@ -223,26 +213,104 @@ def flash_attn_bwd_dq_kernel(
     tl.store(dq_ptrs, tile_dq.to(dq_ptr.dtype.element_ty), mask=mask_MD)    
 
 
+BWD_PARAMS = {
+    "BLK_SIZE_M": Param((32, 64, 128), 64), 
+    "BLK_SIZE_N": Param((32, 64, 128), 64),
+    "num_warps": Param((4, 8), 4),
+    "num_stages": Param((1, 2, 3), 2)
+}
 
-def flash_attn_bwd(Q, K, V, O, dO, lse, causal, deterministic):
+def bwd_args2keys(K, causal, deterministic):
+    return {
+        "N": ceil_pow2(K.shape[2]), 
+        "BLK_SIZE_D": max(16, ceil_pow2(K.shape[3])), 
+        "CAUSAL": int(causal), 
+        "DETERMINISTIC": int(deterministic)
+    }
+
+@tuner(get_dir(__file__) / "bwd_main.csv", BWD_PARAMS, bwd_args2keys, invalidate_cache=False)
+def flash_attn_bwd_main(
+    Q, K, V, 
+    dO, lse, delta, 
+    dQ, dK, dV, 
+    causal, deterministic, 
+    B, H, M, N, D, 
+    scale, scale_log2e, 
+    BLK_SIZE_D, *, BLK_SIZE_M, BLK_SIZE_N, 
+    num_stages, num_warps
+):
+    grid = (ceil_div(N, BLK_SIZE_N), H, B)
+    flash_attn_bwd_main_kernel[grid]( 
+        Q, *Q.stride()[:3],
+        K, *K.stride()[:3],
+        V, *V.stride()[:3],
+        dO, *dO.stride()[:3],
+        lse, *lse.stride()[:2],
+        delta, *delta.stride()[:2],
+        dQ, *dQ.stride()[:3],
+        dK, *dK.stride()[:3],
+        dV, *dV.stride()[:3],
+        M, N, D,
+        scale, scale_log2e,
+        BLK_SIZE_D, causal, deterministic,
+        BLK_SIZE_M, BLK_SIZE_N,
+        num_warps=num_warps, num_stages=num_stages
+    )
+
+@tuner(get_dir(__file__) / "bwd_dq.csv", BWD_PARAMS, bwd_args2keys, invalidate_cache=False)
+def flash_attn_bwd_dq(
+    Q, K, V, 
+    dO, lse, delta, 
+    dQ, dK, dV, 
+    causal, deterministic, 
+    B, H, M, N, D, 
+    scale, scale_log2e, 
+    BLK_SIZE_D, *, BLK_SIZE_M, BLK_SIZE_N, 
+    num_stages, num_warps
+):
+    grid = (ceil_div(M, BLK_SIZE_M), H, B)
+    flash_attn_bwd_dq_kernel[grid](
+        Q, *Q.stride()[:3],
+        K, *K.stride()[:3],
+        V, *V.stride()[:3],
+        dO, *dO.stride()[:3],
+        lse, *lse.stride()[:2],
+        delta, *delta.stride()[:2],
+        dQ, *dQ.stride()[:3],
+        M, N, D,
+        scale, scale_log2e,
+        BLK_SIZE_D, causal,
+        BLK_SIZE_M, BLK_SIZE_N,
+        num_warps=num_warps, num_stages=num_stages
+    )
+
+def flash_attn_bwd(Q, K, V, O, dO, lse, causal, deterministic, out=None):
     assert Q.shape == K.shape == V.shape == O.shape == dO.shape
     assert all(t.stride(-1) == 1 for t in (Q, K, V, O, dO)), "last dim should be stride 1"
+
+    keys = bwd_args2keys(K, causal, deterministic)
 
     B, H, M, D = Q.shape
     N = K.shape[2]
 
     PREPROCESS_BLK_SIZE_M = 128
-    BLK_SIZE_D = max(16, triton.next_power_of_2(D))
+    BLK_SIZE_D = keys["BLK_SIZE_D"]
 
-    delta = torch.empty((B, H, M), device=Q.device, dtype=torch.float32)
-    dQ = torch.empty(Q.shape, device=Q.device, dtype=torch.float32 if not deterministic else Q.dtype)
-    dK = torch.empty(K.shape, device=K.device, dtype=K.dtype)
-    dV = torch.empty(V.shape, device=V.device, dtype=V.dtype)
+    delta, dQ, dK, dV = out if out is not None else (
+        torch.empty((B, H, M), device=Q.device, dtype=torch.float32), 
+        torch.empty(Q.shape, device=Q.device, dtype=torch.float32 if not deterministic else Q.dtype), 
+        torch.empty(K.shape, device=K.device, dtype=K.dtype), 
+        torch.empty(V.shape, device=V.device, dtype=V.dtype), 
+    )
 
+    if out is not None and not deterministic and dQ.dtype != torch.float32 :
+        raise ValueError("Non-deterministic output requires dQ (out[1]) to be float32")
+
+    
     scale = 1.0 / (D ** 0.5)
     scale_log2e = scale * math.log2(math.e)
 
-    flash_attn_preprocess_kernel[(triton.cdiv(M, PREPROCESS_BLK_SIZE_M), H, B)](
+    flash_attn_bwd_preprocess_kernel[(ceil_div(M, PREPROCESS_BLK_SIZE_M), H, B)](
         O, *O.stride()[:3],
         dQ, *dQ.stride()[:3],
         dO, *dO.stride()[:3],
@@ -251,36 +319,29 @@ def flash_attn_bwd(Q, K, V, O, dO, lse, causal, deterministic):
         PREPROCESS_BLK_SIZE_M, BLK_SIZE_D, deterministic
     )
 
-    flash_attn_bwd_kernel[lambda params: (triton.cdiv(N, params["BLK_SIZE_N"]), H, B)](
-        Q, *Q.stride()[:3],
-        K, *K.stride()[:3],
-        V, *V.stride()[:3],
-        dO, *dO.stride()[:3],
-        lse, *lse.stride()[:2],
-        delta, *delta.stride()[:2],
-        dK, *dK.stride()[:3],
-        dV, *dV.stride()[:3],
-        dQ, *dQ.stride()[:3],
-        M, N, D,
-        scale, scale_log2e,
-        BLK_SIZE_D, causal, deterministic,
+    
+    flash_attn_bwd_main(
+        Q, K, V, 
+        dO, lse, delta, 
+        dQ, dK, dV, 
+        causal, deterministic, 
+        B, H, M, N, D, 
+        scale, scale_log2e, 
+        BLK_SIZE_D
     )
-    
-    if deterministic: 
-        flash_attn_bwd_dq_kernel[lambda params: (triton.cdiv(M, params["BLK_SIZE_M"]), H, B)](
-            Q, *Q.stride()[:3],
-            K, *K.stride()[:3],
-            V, *V.stride()[:3],
-            dO, *dO.stride()[:3],
-            lse, *lse.stride()[:2],
-            delta, *delta.stride()[:2],
-            dQ, *dQ.stride()[:3],
-            M, N, D,
-            scale, scale_log2e,
-            BLK_SIZE_D, causal,
-        )
 
-    
-    dQ = dQ.to(Q.dtype) if not deterministic else dQ # atomics for the nondeterministic path only support float32
+    if deterministic:
+        flash_attn_bwd_dq(
+            Q, K, V, 
+            dO, lse, delta, 
+            dQ, dK, dV, 
+            causal, deterministic, 
+            B, H, M, N, D, 
+            scale, scale_log2e, 
+            BLK_SIZE_D
+        )
+        
+    # non deterministic path accumulates in f32 atomics so downcast is needed
+    dQ = dQ.to(Q.dtype) if not deterministic else dQ 
 
     return dQ, dK, dV
