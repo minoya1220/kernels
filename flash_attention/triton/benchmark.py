@@ -68,11 +68,12 @@ def _attn_bwd_reference(Q, K, V, O, dO, lse, *, causal, deterministic):
         mask = torch.ones(Q.shape[-2], K.shape[-2], dtype=torch.bool, device=Q.device).triu(diagonal=1)
         S = S.masked_fill(mask, float('-inf'))
 
-    P = torch.exp(S - lse.unsqueeze(-1))
+    P = torch.exp(S - lse.unsqueeze(-1)).to(torch.bfloat16)
     delta = (dO * O).sum(dim=-1)
     dV = P.mT @ dO 
     dP = dO @ V.mT 
     dS = P * (dP - delta.unsqueeze(-1)) 
+    dS = dS.to(torch.bfloat16)
     dQ = dS @ K * scale
     dK = dS.mT @ Q * scale
 
@@ -116,6 +117,6 @@ if __name__ == "__main__":
 
 
     
-    plot_bench(SEQ_LENS, fwd_times, "Attention Forward", flops=fwd_flops, path=get_dir(__file__) / "plots", xlabel="Sequence Length")
-    plot_bench(SEQ_LENS, bwd_times, "Attention Backward", flops=bwd_flops, path=get_dir(__file__) / "plots", xlabel="Sequence Length")
+    plot_bench(SEQ_LENS, fwd_times, "Attention Forward 3090", flops=fwd_flops, path=get_dir(__file__) / "plots", xlabel="Sequence Length", subtitle="H=16, D=128, B*N=2^15")
+    plot_bench(SEQ_LENS, bwd_times, "Attention Backward 3090", flops=bwd_flops, path=get_dir(__file__) / "plots", xlabel="Sequence Length", subtitle="H=16, D=128, B*N=2^15")
     

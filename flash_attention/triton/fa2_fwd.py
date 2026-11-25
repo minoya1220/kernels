@@ -100,7 +100,7 @@ def fwd_args2keys(K: torch.Tensor, causal):
         "CAUSAL": int(causal), 
     }
 
-@tuner(get_dir(__file__) / "fwd.csv", FWD_PARAMS, fwd_args2keys, invalidate_cache=False)
+@tuner(get_dir(__file__) / "configs" / "fwd.csv", FWD_PARAMS, fwd_args2keys, invalidate_cache=False)
 def flash_attn_fwd(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal, *, out=None, BLK_SIZE_M, BLK_SIZE_N, num_warps, num_stages):
     assert Q.shape == K.shape == V.shape
     assert Q.is_cuda and all(t.stride(-1) == 1 for t in (Q, K, V))

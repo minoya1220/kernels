@@ -6,6 +6,7 @@ from collections.abc import Callable
 import functools
 import inspect
 import torch
+import gc
 from triton.runtime.errors import OutOfResources, PTXASError
 from utils.measure import benchmark
 
@@ -141,6 +142,8 @@ class Tuner:
                     fastest = (config, measured_time)
             except self.errors_to_skip:
                 continue
+            finally:
+                gc.collect() # exceptions
 
         if fastest[0] is None:
             raise RuntimeError(f"no config ran for {keys}")

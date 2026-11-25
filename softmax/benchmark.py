@@ -7,7 +7,6 @@ from utils.python import get_dir
 
 BENCH_SIZE = 2**29
 
-BENCH_DIMS = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
 
 
 
@@ -41,8 +40,8 @@ def benchmark_bwd(dims: list[int], *, dtype=torch.bfloat16, elems=BENCH_SIZE) ->
 
 if __name__ == "__main__":
     
-    torch.manual_seed(123)
 
+    BENCH_DIMS = [2**i for i in range(7, 18)]
     
     # with MeasureMemoryClock(interval=0.01) as mem_clk:
     fwd_times = benchmark_fwd(BENCH_DIMS)

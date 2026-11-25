@@ -30,7 +30,7 @@ def benchmark(bench_fn: Callable, *args, bench_warmup_iters=20, bench_iters=100,
             alias_table = {}
             args_buffer.append(tree_map_only(torch.Tensor, clone_helper, packed_args))
             if idx == 0:
-               args_size = sum(tensor.nbytes for tensor in alias_table.values())
+                args_size = sum(tensor.nbytes for tensor in alias_table.values())
             buffer_size += args_size
             idx += 1
             
@@ -52,8 +52,9 @@ def benchmark(bench_fn: Callable, *args, bench_warmup_iters=20, bench_iters=100,
 
     g = torch.cuda.CUDAGraph()
 
-    outs = deque(maxlen=len(args_buffer))
+    
     with torch.cuda.graph(g):
+        outs = deque(maxlen=len(args_buffer))
         for i in range(0, bench_iters):
             args_i, kwargs_i = args_buffer[i % len(args_buffer)] 
             outs.append(bench_fn(*args_i, **kwargs_i))
@@ -67,7 +68,6 @@ def benchmark(bench_fn: Callable, *args, bench_warmup_iters=20, bench_iters=100,
         end.record()
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end) / bench_iters)
-
     return median(times)
 
 

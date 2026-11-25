@@ -228,7 +228,7 @@ def bwd_args2keys(K, causal, deterministic):
         "DETERMINISTIC": int(deterministic)
     }
 
-@tuner(get_dir(__file__) / "bwd_main.csv", BWD_PARAMS, bwd_args2keys, invalidate_cache=False)
+@tuner(get_dir(__file__) / "configs" / "bwd_main.csv", BWD_PARAMS, bwd_args2keys, invalidate_cache=False)
 def flash_attn_bwd_main(
     Q, K, V, 
     dO, lse, delta, 
@@ -257,7 +257,7 @@ def flash_attn_bwd_main(
         num_warps=num_warps, num_stages=num_stages
     )
 
-@tuner(get_dir(__file__) / "bwd_dq.csv", BWD_PARAMS, bwd_args2keys, invalidate_cache=False)
+@tuner(get_dir(__file__) / "configs" / "bwd_dq.csv", BWD_PARAMS, bwd_args2keys, invalidate_cache=False)
 def flash_attn_bwd_dq(
     Q, K, V, 
     dO, lse, delta, 
